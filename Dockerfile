@@ -1,4 +1,4 @@
-FROM   3.13.18-alpine3.24
+FROM   python:3.13.18-alpine3.24
 WORKDIR /app
 COPY  . .
 EXPOSE 8000
