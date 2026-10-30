@@ -7,6 +7,13 @@ resources:
 replicas:
   - name: omkar-app
     count: 5
-
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: omkar-service  # Replace with the actual Service name defined in ../../bases/Service.yaml
+      spec:
+        type: LoadBalancer
 
 
