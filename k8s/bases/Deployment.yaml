@@ -17,7 +17,7 @@ spec:
     spec: 
       containers: 
         - name: omkar-container  
-          image: omkarsahastrabudhe/idfy-testing:latest
+          image:  omkarsahastrabudhe/idfy-arm64:latest
           ports: 
             - containerPort: 8000
 
