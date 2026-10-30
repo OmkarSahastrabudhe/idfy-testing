@@ -13,6 +13,13 @@ patches:
       kind: Service
       metadata:
         name: omkar-service  # Replace with the actual Service name defined in ../../bases/Service.yaml
+        annotations:
+          # 1. Tells the AWS Load Balancer Controller to take over this service
+          service.beta.kubernetes.io/aws-load-balancer-type: external
+          # 2. Makes the load balancer accessible from the internet (default is internal)
+          service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+          # 3. Routes traffic to your EC2 instance nodes
+          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: instance
       spec:
         type: LoadBalancer
 
