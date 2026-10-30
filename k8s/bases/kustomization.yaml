@@ -5,3 +5,5 @@ resources:
   - Deployment.yaml
   - Service.yaml
   - HPA.yaml
+  - victoriaMetrics.yaml
+  - nodeExporter.yaml
