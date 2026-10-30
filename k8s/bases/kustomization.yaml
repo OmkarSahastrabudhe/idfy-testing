@@ -5,4 +5,5 @@ resources:
   - Deployment.yaml
   - Service.yaml
   - HPA.yaml
+  - ingress.yaml
   
