@@ -1,0 +1,26 @@
+apiVersion: apps/v1 
+kind: Deployment 
+metadata: 
+  name: omkar-app
+  labels:
+    app: omkar 
+spec:
+  replicas: 3 
+  selector:
+    matchLabels:
+      app: omkar
+  template:
+    metadata: 
+      name: omkar-pod 
+      labels: 
+        app: omkar
+    spec: 
+      containers: 
+        - name: omkar-container  
+          image: 638614235500.dkr.ecr.ap-south-1.amazonaws.com/idfy-testing
+          ports: 
+            - containerPort: 8000
+
+
+
+            
