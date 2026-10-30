@@ -15,6 +15,6 @@ patches:
         name: omkar-service  # Replace with the actual Service name defined in ../../bases/Service.yaml
         
       spec:
-        type: NodePort
+        type: LoadBalancer
 
 
