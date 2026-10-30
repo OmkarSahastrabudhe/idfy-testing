@@ -15,11 +15,5 @@ spec:
                 name: omkar-service
                 port:
                   number: 8000
-           - path: /omkar
-            pathType: Prefix
-            backend:
-              service:
-                name: omkar-service
-                port:
-                  number: 8000
+         
            
