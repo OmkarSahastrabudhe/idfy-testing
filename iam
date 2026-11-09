@@ -1,0 +1,47 @@
+Aap cooked nahi ho. Aapka gap sirf ek hai: aap abhi IAM ko permissions ki lambi list ki tarah dekh rahe ho. Asal mein IAM ek chhota sa model hai. Woh model ek baar dimaag mein baith gaya, to saare errors ek hi pattern ke dikhenge.
+
+IAM ka core model: sirf teen sawaal
+GCP mein har API call par IAM teen sawaal poochta hai:
+
+Kaun hai? Ise principal kehte hain. Ye koi user ho sakta hai, jaise aap. Ya service account, jaise runner SA. Ya group.
+Kya karna chahta hai? Ise permission kehte hain, jaise cloudbuild.builds.create. Har API action ki ek permission hoti hai.
+Kahan karna chahta hai? Ise resource kehte hain, jaise project idfy-platform-dev, ya ek service account, ya ek bucket.
+Permissions hazaaron hain, isliye unhe ek-ek karke nahi diya jaata. Permissions ko bundle mein pack karte hain, jise role kehte hain. Kaun, kaunsa role, kis resource par: is jode ko binding kehte hain. Har resource ke paas apni bindings ki list hoti hai, jise IAM policy kehte hain.
+
+Analogy: Ek building socho. Principal ek insaan hai. Permission ek darwaza kholna hai. Role ek chaabiyon ka guccha hai. Binding ka matlab hai ki is insaan ko is floor ka ye guccha diya gaya. Har floor ke guard ke paas apni list hoti hai, aur woh list hi policy hai.
+
+Inheritance: GCP mein ek hierarchy hoti hai: Organization, phir Folder, phir Project, phir Resource. Upar di gayi binding neeche apne aap lag jaati hai. Project par role diya, to us project ke har resource par woh lag gaya.
+
+Cross-project wali baat: Runner SA idfy-devops-prod mein bana hai, lekin kaam idfy-platform-dev mein karta hai. SA kahan bana, isse fark nahi padta. Fark ye padta hai ki binding kis project ki policy mein likhi hai. Isliye runner ko idfy-platform-dev ki policy mein jagah chahiye.
+
+Sabse important insight: Service account ke do chehre hote hain.
+
+Principal ki tarah: Ye kaam karta hai. Jaise function fn-sa ki identity se schedulers ko resume karta hai.
+Resource ki tarah: Iski khud ki IAM policy hoti hai, jo batati hai ki is SA ko kaun use kar sakta hai.
+actAs isi dusre chehre se aata hai. Runner ko fn-sa ki policy mein roles/iam.serviceAccountUser chahiye. Isliye kuch roles project par diye jaate hain aur kuch sirf ek SA par. Aapka confusion yahin se aa raha tha.
+
+Aapke saare errors isi model mein:
+
+Error	Kaun	Kya	Kahan
+Pehla	Runner SA	artifactregistry.repositories.get	Project idfy-platform-dev
+Dusra	Runner SA	cloudbuild.builds.create	Project idfy-platform-dev
+Aage aayega	Runner SA	iam.serviceAccounts.actAs	SA fn-sa, yaani SA ek resource ki tarah
+Learning backlog: is order mein padho
+Har topic ke saath ek chhota hands-on task diya hai. Ise apne dev project mein ya Cloud Shell mein karo.
+
+Principal, permission, role aur binding: Upar wala model. Task ke liye gcloud iam roles describe roles/run.sourceDeveloper chalao aur dekho ki is guchhe mein kaunsi permissions hain.
+Role ke teen types: Basic roles hain owner, editor aur viewer, aur ye bahut broad hain, inse bachna. Predefined roles Google ke banaye hue hain. Custom roles aap khud banate ho. Task ke liye editor aur run.developer ki permissions compare karo.
+Resource hierarchy aur inheritance: Org, folder, project, resource. Task ke liye gcloud projects get-ancestors idfy-platform-dev chalao.
+Service accounts ke do chehre: Principal aur resource. Task ke liye ek SA ki get-iam-policy aur project ki get-iam-policy mein us SA ko dhoondo, aur dono ka fark dekho.
+actAs aur roles/iam.serviceAccountUser: Ye kyun hai, aur privilege escalation kaise rokta hai. Upar wala ID card example yahi hai.
+Service agents aur default SAs: Google ki apni services, jaise Cloud Build aur Cloud Run, bhi apne SAs se chalti hain. Task ke liye gcloud builds get-default-service-account chalao.
+Authentication vs authorization: Authentication batata hai ki aap kaun ho. Authorization batata hai ki aap kya kar sakte ho. IAM roles sirf authorization hain. Login hone ke tareeke alag hain: SA key file, jo aapka purana GOOGLE_AUTH tha, VM ya runner ka metadata server, Workload Identity, aur impersonation. Task ke liye gcloud auth list dekho.
+Cross-project access: Ek project ka SA doosre project mein kaam kar sakta hai. Aapka runner SA isi ka example hai.
+Debugging tools: Error message mein Policy Troubleshooter ka link hota hai. Cloud Audit Logs mein dikhta hai ki kis principal ka kaunsa call deny hua.
+Least privilege: Sabse chhota role, sabse chhote resource par do. Jaise serviceAccountUser sirf ek SA par dena, poore project par nahi.
+IAM conditions aur deny policies: Conditions se time ya resource ke hisaab se limit lagti hai. Deny policies allow ko bhi override kar deti hain. Ye advanced topic hai, baad mein padhna.
+IAM Terraform mein: google_project_iam_member sirf ek binding add karta hai, aur ye safe hai. google_project_iam_binding us role ke saare members ko overwrite kar deta hai. google_project_iam_policy poori project policy overwrite kar deta hai, aur ye bahut dangerous hai. Production mein galti se doosron ka access chhin jaata hai.
+Practical advice
+Pehle topic 1 se 5 tak ek-do din mein khatam karo. Aapke current issue ka 90% hissa inhi mein hai. Topic 6 se 9 tak aapko debugging mein independent bana denge. Topic 10 se 12 tak production-grade kaam ke liye zaroori hain.
+
+Official resource ke liye Google Cloud docs ka "IAM overview" page aur "Service accounts overview" page padho. Skills Boost par "IAM" wale labs bhi hands-on ke liye achhe hain.
