@@ -1,0 +1,16 @@
+static-analysis (sast, dependencies, secrets_scan)
+  -> semantic-tagging (versioning)
+  -> build (docker build -> syft SBOM -> grype scan -> push GAR/ECR)
+Roadmap
+Phase	Kya seekhna hai	Keywords	Kahan padhna hai
+1. Skeleton	Pipeline → stage → job, aur runner job ko container mein kaise chalata hai	stages, image, script, before_script, after_script, top-level variables	search-service/.gitlab-ci.yml, common-ci-pipeline/.gitlab-ci.yml
+2. Job kab chalega	rules top-to-bottom evaluate hota hai, first match wins	rules: if / when, when: never / manual / on_success, allow_failure, predefined vars: CI_COMMIT_BRANCH, CI_PIPELINE_SOURCE, CI_COMMIT_TAG, CI_COMMIT_REF_PROTECTED, CI_COMMIT_MESSAGE	build.yml:435-446
+3. Jobs ke beech data flow	Ek job ka output doosre job tak kaise pahunchta hai	artifacts: paths / when / expire_in, artifacts: reports: dotenv, needs (DAG) vs stage ordering	versioning.yml:193-195 (SEMANTIC_TAG), build.yml:297-314 (evidence gate)
+4. Components (sabse important)	Component kaise likhte aur consume karte hain	include: component, @version pinning, spec: inputs (default, options, regex, type), $[[ inputs.x ]]	dependencies.yml:1-15, build.yml:1-79
+5. Variable precedence aur hardening	Project CI/CD variables job-level variables: ko override kar dete hain, isliye IDfy gate values before_script mein unset + export karta hai	variable precedence, GIT_STRATEGY, GIT_DEPTH, audit vs enforce, fail-closed	build.yml:107-117, secrets.yml:26-28
+6. Docker build job	Image build, scan aur push ka poora chain	services (dind), DOCKER_HOST, BuildKit --secret, CI_JOB_TOKEN, GCP JWT → AWS STS → ECR login	build.yml:84-97, build.yml:174-204
+7. Component release	Component ka version tag kaise cut hota hai	release: keyword, semantic-release, conventional commits (fix: / feat: / BREAKING CHANGE)	common-ci-pipeline/.releaserc.json, dono repos ke MAINTAINERS.md
+8. Capstone	search-service ko current standard par migrate karne ka plan likho	sab kuch	neeche dekho
+Phase 4 ka core point: $[[ inputs.x ]] pipeline create hote waqt text replace hota hai, jabki $VAR job run hote waqt shell resolve karta hai. Isi wajah se branch list rules: regex mein input se jaati hai, variable se nahi.
+
+Low priority (in files mein use nahi hue): cache, parallel: matrix, trigger, environment, workflow, extends. only/except legacy hai; sirf padhna aana chahiye, likhna nahi.
