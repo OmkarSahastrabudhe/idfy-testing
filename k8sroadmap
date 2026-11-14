@@ -1,0 +1,49 @@
+tools/logging, tools/monitoring, tools/victoriametrics, tools/vm-agent, tools/vmalert sab plain Kustomize hain. Helm-through-Kustomize ka pattern privy/privy-delivery/privy-deployment (aur uska twin data-compass/privy-deployment-internal) mein hai. Isliye roadmap 4 levels ka hai, simple se Helm tak.
+
+Core engine (zero code)
+Kustomize ek YAML photocopy + sticker machine hai. bases/ original document hai, overlays/<cluster>/ us par cluster-specific stickers lagata hai (image tag, env, replicas). Output hamesha plain YAML hota hai; cluster ko Kustomize ka pata hi nahi chalta.
+
+IDfy mein delivery chain aise chalti hai:
+
+
+tools/argocd (app-of-apps)
+  → argocd-apps/<bu>-argocd-apps/manifests/<cluster>/<app>.yaml   (Application CRD)
+    → k8s/<bu>/<app> repo, path: overlays/<cluster>
+      → ArgoCD khud `kustomize build` chalata hai → cluster apply
+CI sirf lint karta hai (internal-tools/kustomize-central-ci: kustomize-lint, kubeconform, config-lint); deploy ArgoCD karta hai.
+
+Roadmap
+Level	Repo padho	Ye concepts pakdo	Clear tab jab...
+1. Base/Overlay	eve/namematch (6 files)	resources, namespace, images.newTag, configMapGenerator + behavior: merge, hash suffix	bata sako ki newTag commit hote hi pod kyun restart hota hai
+2. Patches + Operator CRDs	tools/victoriametrics → tools/vm-agent → tools/vmalert → tools/monitoring	patchesStrategicMerge, secretGenerator, generatorOptions.disableNameSuffixHash, ExternalSecret, VM CRDs (VMAgent, VMRule, VMServiceScrape)	ek naya alert rule file kisi overlay mein add kar sako
+3. Components	tools/logging/bases-v2 + overlays/artemis	kind: Component, platform base (bases-aws vs bases-gke) + env tier (components/prod), replicas, images.newName	samjha sako ki resources aur components ka farak kya hai
+4. Helm + Flux	privy-deployment: DESIGN.md → cluster/homam/ → bases/	helmCharts, helmGlobals, replacements, JSON6902 patch, local-config annotation, Flux OCIRepository + HelmRelease.valuesFrom	ci/render.sh homam ka output line-by-line trace kar sako
+5. Delivery	tools/argocd/overlays/prod/argo-apps.yaml, argocd-apps/kyc-argocd-apps	app-of-apps, Application.source.path, AppProject RBAC (policies/*.csv)	kisi bhi running pod se ulta chal kar uska git file dhundh sako
+Level 4 ka internal flow (jo tumne specifically poocha)
+Yahan Helm values Kustomize ke through do hops mein set hoti hain:
+
+cluster/homam/global.yaml ek local Helm chart (bases/overrides) ko feed hota hai. Ye chart kabhi install nahi hota; ye sirf ek ConfigMap global-overrides render karta hai jisme har chart ki values hain.
+replacements.yaml us render se chart URL aur namespace utha kar OCIRepository / HelmRelease objects mein copy karta hai.
+versions/ring-0 Component chart version (spec.ref.tag) patch karta hai.
+cluster/homam/dependencies.yaml jaise patches HelmRelease.spec.values mein per-cluster overrides daalte hain.
+CI kustomize build --enable-helm karke result ko OCI artifact banata hai; cluster ka Flux use pull karke asli helm install karta hai.
+
+helmGlobals: {chartHome: ../../bases}
+helmCharts:
+  - {name: overrides, releaseName: overrides, valuesFile: global.yaml}   # hop 1
+replacements: [{path: ../../bases/replacements.yaml}]                    # hop 2
+components: [../../versions/ring-0]                                      # hop 3
+patches: [{path: dependencies.yaml}]                                     # hop 4
+Yani Kustomize yahan Helm chart ko render nahi kar raha; wo Flux ke HelmRelease objects ko assemble kar raha hai. Privy yahan ArgoCD nahi, Flux use karta hai.
+
+Hidden gotchas
+Plaintext password in git: tools/monitoring/overlays/prod/kustomization.yaml mein GF_SECURITY_ADMIN_PASSWORD literal likha hai. Koi grafana-secrets ExternalSecret ise override karta hai ya nahi, ye maine verify nahi kiya.
+Deprecated fields: purane repos bases: aur patchesStrategicMerge: use karte hain; naye (privy-deployment) resources: aur patches:. Dono padhna aana chahiye.
+disableNameSuffixHash: true (vm-agent, grafana-settings): config badalne par pod auto-restart nahi hoga.
+versions/ring-0 edit = blast radius: us ring ke saare clusters re-publish hote hain.
+Logging overlay mein INDEX_NAME badalna index mapping conflicts (400 errors) se juda hai; comment padhe bina mat chhedo.
+Privy render ke liye --enable-helm --load-restrictor LoadRestrictionsNone zaroori hai, warna build fail hoga.
+Abhi kya karo
+Tumhare machine par kustomize installed nahi hai (helm hai). brew install kustomize karo, phir eve/namematch clone karke kustomize build overlays/grus chalao aur output ko bases/main.yaml se diff karo. Wahi Level 1 ka poora lesson hai.
+
+ArgoCD ke do Applications (qdrant-facedb, opik-llm) mein helm: source dikha, jo teesra pattern hai (ArgoCD-native Helm); wo maine abhi khola nahi.
