@@ -1,0 +1,99 @@
+Repo scan ho gaya. Roadmap tumhare actual code pe map kiya hai, taaki har concept ka live example isi repo mein mile.
+
+## Ye repo kya hai
+
+Dekho, ye ek **module library** hai, live infra nahi: 31 independent root-style modules (`networking`, `eks-stack`, `aurora`, `kms`...), jinhe Terragrunt bahar se call karta hai.
+
+- **Backend/state yahan nahi hai.** Koi `backend` block nahi; state config Terragrunt generate karta hai.
+- **Har module apna `provider "aws"` khud declare karta hai** ([kms/1-versions.tf](kms/1-versions.tf#L16-L34)). Isliye ye modules kisi doosre module ke andar `count`/`for_each`/`depends_on` ke saath call nahi ho sakte.
+- **Blast radius commit message se decide hota hai.** `[module] BREAKING:` / `feat:` / `fix:` se CI semver tag banata hai ([.gitlab-ci.yml](.gitlab-ci.yml)), aur consumers tag pin karte hain. Output rename ya resource address change karoge to downstream Terragrunt `dependency` blocks tootenge.
+
+Repo ka usage count batata hai kahan zyada time dena hai: `count` 189, `merge()` 102, `for_each` 93, `one()` 82, `optional()` 50, `jsonencode` 47, `dynamic` 43, `depends_on` 43, `validation` 24, `precondition` 14.
+
+## Phase 1: Core engine (isके bina baaki sab ratta hai)
+
+1. **Dependency graph (DAG):** Terraform file order nahi dekhta; references se graph banata hai aur parallel walk karta hai. `0-`, `1-`, `2-` prefixes sirf insaan ke liye hain.
+2. **Plan = config vs state vs real API ka 3-way diff:** refresh, phir diff, phir apply.
+3. **State:** resource address se real ID ki mapping. Seekho `terraform state list/show/mv/rm`, locking, aur ye ki secrets state mein plaintext hote hain.
+4. **Known vs unknown values:** `(known after apply)` sabse important concept hai; Phase 2 ke aadhe errors yahin se aate hain.
+5. **Type system:** `string/number/bool`, `list/set/map`, `object/tuple`, `null`, `any`. `null` ka matlab "argument diya hi nahi", yaani provider default lagega.
+
+## Phase 2: Conditions aur loops (tumhara main focus)
+
+| Pattern | Kab use karna | Repo example |
+|---|---|---|
+| `cond ? a : b` | Value choose karna. Dono branches ka type same hona chahiye. | [coturn/2-main.tf:60](coturn/2-main.tf#L60) |
+| `count = cond ? 1 : 0` | Resource on/off toggle. | [kms/2-main.tf:21](kms/2-main.tf#L21) |
+| `one(res[*].attr)` | `count` wale resource ko safely refer karna; 0 elements pe `null` deta hai. | [coturn/2-main.tf:37](coturn/2-main.tf#L37) |
+| `try(res[0].id, null)` | Same kaam, lekin har error nigal jaata hai, typo bhi chhup jaata hai. Outputs mein `one()` behtar hai. | [networking/0-outputs.tf:22](networking/0-outputs.tf#L22) |
+| `for_each` map/set pe | Multiple instances stable keys ke saath. | [networking/6-peering.tf:67](networking/6-peering.tf#L67) |
+| `for_each = cond ? {...} : {}` | Conditional `for_each`. | [networking/6-peering.tf:98](networking/6-peering.tf#L98) |
+| `dynamic "block"` | Nested blocks (ingress, rules) ka loop ya optional block. | [bastion/2-main.tf:51](bastion/2-main.tf#L51), [opensearch/2-main.tf:102](opensearch/2-main.tf#L102) |
+| `for` expressions | List/map transform aur filter (`if`), grouping (`...`). | [eks-stack/4-node-groups.tf:13](eks-stack/4-node-groups.tf#L13) |
+| `flatten` + nested `for` | Nested structure ko flat list banana, phir `for_each` map mein convert karna. | wahi file |
+
+**Must-know gotchas:**
+- **`count` vs `for_each`:** `count` index-based hai. List ke beech se element hataoge to baad wale sab resources destroy/recreate honge. List of things ke liye hamesha `for_each`; `count` sirf 0/1 toggle ke liye.
+- **`for_each` keys plan time pe known honi chahiye.** Key mein kisi resource ka computed ID daaloge to "Invalid for_each argument" aayega. Key hamesha input variable se banao, jaise peering mein `p.peer_vpc_id`.
+- **`toset()`** list ko `for_each` ke liye convert karta hai, lekin order aur duplicates kho jaate hain.
+- **`coalesce()` vs `try()` vs `lookup()`:** `coalesce` first non-null/non-empty deta hai, `try` first non-error, `lookup` map key with default.
+- **`&&` / `||` ka short-circuit** sirf Terraform 1.12+ mein hai. Purane versions mein `var.x != null && var.x.y` crash karta hai; wahan nested ternary ya `try()` lagta hai.
+
+## Phase 3: Validation ki 4 layers
+
+1. **`variable` `validation`** input pe sabse pehle fail karta hai ([aurora/0-variables.tf:87](aurora/0-variables.tf#L87)). 1.9+ se doosre variables bhi refer kar sakte ho.
+2. **`can(regex(...))` + `alltrue([for ...])`** format aur list checks ka idiom hai ([multi-region-kms/0-variables.tf:114](multi-region-kms/0-variables.tf#L114)).
+3. **`precondition`** `lifecycle` ke andar cross-variable assumptions check karta hai ([aurora/2-main.tf:130](aurora/2-main.tf#L130)). Ye repo ka sabse accha example hai, comments ke saath.
+4. **`postcondition` aur `check` blocks** repo mein kahin use nahi hue. `postcondition` apply ke baad guarantee deta hai; `check` sirf warning deta hai, apply block nahi karta.
+
+Saath mein: `nullable = false` ([aurora/0-variables.tf:85](aurora/0-variables.tf#L85)), `optional(type, default)` ([internal-dns-records/0-variables.tf:26](internal-dns-records/0-variables.tf#L26)), `sensitive = true`.
+
+## Phase 4: Lifecycle aur ordering
+
+- **`ignore_changes`** tab lagta hai jab koi external system attribute badalta hai. [eks-stack/4-node-groups.tf:137](eks-stack/4-node-groups.tf#L137) mein autoscaler `scaling_config` badalta hai, isliye Terraform use revert nahi karta.
+- **`create_before_destroy`** ([aurora/2-main.tf:55](aurora/2-main.tf#L55)) attached parameter groups jaise resources ke liye hai. Ye dependency chain mein upar propagate hota hai, aur name unique hona chahiye (`name_prefix`).
+- **`prevent_destroy` aur `replace_triggered_by`** repo mein nahi hain. DB aur KMS pe `prevent_destroy` seekhne layak hai.
+- **`depends_on`** sirf hidden dependencies ke liye hai (IAM propagation, policy attachments). Overuse se values "known after apply" ban jaati hain aur plan noisy hota hai.
+- **`time_sleep`** ([opensearch/2-main.tf:74](opensearch/2-main.tf#L74)) AWS eventual consistency ka workaround hai: service-linked role banne ke 60s baad domain create hota hai.
+
+## Phase 5: Providers aur multi-region/account
+
+- **`alias` + `provider = aws.replication_region`** ([kms/2-main.tf:28](kms/2-main.tf#L28)) se ek hi module do regions mein resources banata hai.
+- **`default_tags`** `merge()` ke saath provider level pe tagging karta hai.
+- **`assume_role`** yahan commented hai; auth Terragrunt/CI layer se aa raha hai.
+- **`configuration_aliases`** reusable child modules ka sahi pattern hai. Repo mein nahi hai; contrast ke liye seekho.
+- **Version constraints:** `~> 5.81.0` sirf patch updates allow karta hai. `.terraform.lock.hcl` ka role bhi samjho.
+
+## Phase 6: State surgery aur refactoring
+
+- **`import` block** ka advanced example [eks-stack/3-cluster.tf:47](eks-stack/3-cluster.tf#L47) mein hai: log group pehle se exist kare to hi import hota hai, `for_each` ke through.
+- **`moved` block** repo mein kahin nahi hai. Resource rename ya `count` se `for_each` migration bina destroy ke isi se hota hai; module library ke liye ye critical skill hai.
+- **`removed` block**, `terraform state mv/rm`, `-replace`, `-target` (sirf emergency mein), `-refresh-only`.
+
+## Phase 7: Module design
+
+- Variable/output contract; outputs ko Terragrunt `dependency` ke hisaab se design karna.
+- `jsonencode` vs `data "aws_iam_policy_document"` IAM policies ke liye.
+- `templatefile()` user_data ke liye ([rabbitmq/2-main.tf:49](rabbitmq/2-main.tf#L49)).
+- Secrets: `sensitive`, `ephemeral` resources aur write-only arguments (1.10/1.11+), taaki password state mein na jaaye.
+
+## Phase 8: Terragrunt, CI, testing
+
+- **Terragrunt:** `include`, `dependency` + `mock_outputs`, `generate`, `run-all` ka ordering.
+- **CI flow:** `fmt`, `validate`, spec lint, version calculation, tag ([ci/](ci/)).
+- **Missing cheezein jo seekhni chahiye:** `terraform test` (`.tftest.hcl`), `tflint` (pre-commit mein commented hai), `checkov`/`trivy`, plan ko JSON mein padhna (`terraform show -json`).
+
+## Repo ke hidden gotchas
+
+- **Version constraint galat hai:** 29 modules `required_version = ">= 1.0"` bolte hain, lekin `optional()` defaults ko 1.3+ chahiye aur `import` + `for_each` ko 1.7+. Purane binary pe constraint pass hoga aur phir syntax error aayega.
+- **Provider drift:** 23 modules AWS provider `~> 5.81.0` pe hain, 6 modules 6.x pe. v5 se v6 mein breaking changes hain, isliye patterns blindly copy mat karna.
+- **Relative path:** `templatefile("files/...")` mein `path.module` nahi hai. Ye sirf isliye chalta hai kyunki module root ki tarah run hota hai.
+
+## Kis order mein padhna
+
+1. [elastic-ip/](elastic-ip/), phir [kms/](kms/): basics aur provider alias.
+2. [networking/](networking/): `count`, `for_each`, locals, peering.
+3. [aurora/](aurora/): validation, precondition, lifecycle ka best example.
+4. [eks-stack/](eks-stack/): sab kuch ek saath, plus `import` aur `flatten`.
+
+Har phase ke baad ek chhota experiment karo: scratch folder mein `terraform console` kholke `for`, `flatten`, `try`, `one` expressions haath se chalao. Console sabse fast feedback loop hai.
