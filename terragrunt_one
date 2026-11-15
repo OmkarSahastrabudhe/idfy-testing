@@ -1,0 +1,53 @@
+Dekho, repo scan karne ke baad picture ye hai: Terragrunt engine hai, Insta Setup Core uske upar ka factory floor. Pehle engine samjho, phir factory. Isliye roadmap do parts mein hai, aur har step pe isi repo ki real file padhni hai.
+
+Big picture (IDfy ka flow)
+
+Universe repo (per-env YAML inputs)
+   │  include: gateway/application.gitlab-ci.yml  + CORE_VERSION pin
+   ▼
+GitLab CI → git clone insta-setup-core@CORE_VERSION → YAML copy into files/
+   ▼
+Terragrunt (terragrunt_manifests/) → tf-modules-aws / tf-modules-gcp @ version tag
+   ▼
+AWS/GCP infra  +  state in GCS bucket idfy-terraform-admin-{universe}
+   ▼
+copy_secrets → ArgoCD app automation (apps cluster pe aate hain)
+Universe repo sirf "kya chahiye" batata hai (YAML). Core repo "kaise banega" jaanta hai. tf-modules-* actual Terraform resources rakhte hain.
+
+PART 1 — Terragrunt roadmap
+#	Concept	Is repo mein kahan padhna hai	Kya samajhna hai
+1	Terragrunt kyun exist karta hai	—	Terraform mein backend/provider config har module mein copy-paste hota hai. Terragrunt ek wrapper hai jo ye DRY karta hai aur modules ke beech ordering sambhalta hai.
+2	root.hcl + include	aws/gateway/root.hcl	find_in_parent_folders("root.hcl") se har child apna parent config inherit karta hai. generate "provider" block runtime pe provider.tf likhta hai.
+3	remote_state	same file	State GCS mein jaati hai (AWS infra ki bhi). prefix = path_relative_to_include() ka matlab har module ka state alag folder mein, e.g. networking/, eks-stack/.
+4	terraform { source }	aws/gateway/networking/terragrunt.hcl	git::...tf-modules-aws.git//networking?ref=networking-${version} — module git tag se .terragrunt-cache mein download hota hai.
+5	locals + yamldecode(file())	same file	Version aur inputs dono files/gateway-inputs.yaml se aate hain. YAML ka top-level key = ek module.
+6	inputs = merge(...)	same file	YAML values + dependency outputs merge hoke Terraform ko TF_VAR_* ke roop mein milte hain.
+7	dependency + mock_outputs	aws/gateway/eks-stack/terragrunt.hcl	eks-stack ko vpc_id networking ke state se milta hai. mock_outputs isliye hain ki pehli baar plan chale jab networking abhi bana hi nahi.
+8	run-all aur DAG	gitlab-ci/common.gitlab-ci.yml line 79, 89	Terragrunt dependency graph banata hai: account-setup → networking → infra-addons → eks-stack, aur usi order mein apply karta hai.
+9	AWS vs GCP diff	aws/gateway vs gcp/gateway	Same pattern, bas account-setup ↔ project-setup, eks-stack ↔ gke-stack.
+10	Gateway vs Application	*/gateway vs */application	Gateway mein account/project setup hai, application mein nahi. Dono ke outputs ka diff nikaalo.
+Hands-on checkpoint: files.aws/ ko files/ mein copy karke terragrunt run-all plan locally chalao, aur terragrunt graph-dependencies se DAG dekho.
+
+PART 2 — Insta Setup Core roadmap
+#	Layer	Files	Kya samajhna hai
+1	Entry point: CI include	gitlab-ci/gateway.gitlab-ci.yml, application.gitlab-ci.yml	.initial_setup universe YAML se yq karke cloud/region/account nikalta hai, core ko CORE_VERSION pe clone karta hai, aur files/ banata hai.
+2	Input contract	files.aws/gateway-inputs.yaml, files.gcp/	global, account_setup, networking, infra_addons, eks_stack keys. Ye hi universe repo ka interface hai.
+3	Pipeline stages	gitlab-ci/common.gitlab-ci.yml	Rules: *-inputs.yaml badla to static path, *-resources-inputs.yaml badla to dynamic path.
+4	Static path	Part 1 ke manifests	run-all plan → manual run-all apply.
+5	Utility scripts	scripts/utility/	format_inputs.py (nested YAML flatten), assume_terragrunt_role.sh (AWS STS), copy_secrets.py, get_terraform_outputs.py.
+6	Dynamic path	scripts/DynamicResources/ — main.py se shuru	ChangedResourceDetector purane vs naye YAML ka diff nikalta hai. Generator .hcl.tpl (rds, redis, s3, aurora, ...) se per-resource terragrunt.hcl banata hai. DynamicJobs generated-pipeline.yml child pipeline banata hai. ResourceHistoryHandler GCS mein resource.json track karta hai.
+7	ArgoCD automation	scripts/ArgocdAppAutomation/	Terraform outputs lekar source universe ke config ko naye universe ke liye template karta hai aur GitLab MR banata hai.
+8	Bundler (latest kaam)	scripts/DynamicResources/bundler/, gitlab-ci/bundle.gitlab-ci.yml, docs/adr	Recent commits "lean bundle" isi pe hain. Maine ise abhi andar se nahi padha, ADR se shuru karna.
+9	Release flow	CHANGELOG.md	Core mein change → tag → universe repo mein CORE_VERSION bump.
+Gotchas jo abhi se dhyan mein rakho
+sed se module swap: .initial_setup flags (account_setup_exists, networking_exists, account_setup_dr) ke basis pe terragrunt.hcl ka source line runtime pe -bypass / -dr module se replace karta hai. Agar tum source line ka format badloge to ye sed match nahi karega aur pipeline fail hogi.
+Relative paths: ../../../../files/... hardcoded hai. Folder depth badli to sab tootega.
+Blast radius: yahan ka har change saare universes pe lagta hai jab wo CORE_VERSION bump karte hain.
+State bucket: skip_bucket_creation = false hai, to naye universe ka bucket Terragrunt khud bana deta hai idfy-terraform-admin project mein.
+assume_terragrunt_role.sh || true: role assume fail hua to bhi pipeline aage badhti hai, error baad mein auth failure ke roop mein dikhega.
+Suggested order
+Part 1 steps 1–8 (AWS gateway ke 4 modules).
+Part 2 steps 1–4, ek poora static pipeline run trace karo.
+Part 2 step 6 (dynamic), ye sabse bada chunk hai.
+Steps 5, 7, 8, 9.
+Agla step: research: aws/gateway bolo to main Part 1 ko line-by-line data flow ke saath trace kar dunga.
