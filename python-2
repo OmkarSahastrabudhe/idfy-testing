@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Tests for validator.py team scope checks.
+
+Each test copies a real overlay (policies/ + teams.yaml + kustomization.yaml)
+into a temp dir, applies one change, and asserts which rule fires.
+
+Run:  python -m unittest discover -s tests -v
+Data: POLICY_ROOT env var (default: 'alpha' if present, else repo root).
+"""
+import contextlib
+import io
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+import validator  # noqa: E402
+
+ROOT = REPO / os.environ.get("POLICY_ROOT", "alpha" if (REPO / "alpha").is_dir() else ".")
+ENV_DIR = ROOT / "overlays" / "staging"
+
+
+def run_validation(env_dir):
+    """Return (ok, all error strings) for one overlay directory."""
+    pol = env_dir / "policies"
+    with contextlib.redirect_stdout(io.StringIO()):
+        syntax = validator.PolicyValidator(str(pol))
+        syntax_ok = syntax.validate_all_policies()
+        scope = validator.ScopeValidator(pol).run(syntax.policy_files())
+    results = syntax.results + scope
+    errors = [e for r in results for e in r.errors]
+    return syntax_ok and all(r.is_valid for r in scope), errors
+
+
+class ScopeTests(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="rbac-test-"))
+        self.env = self.tmp / "staging"
+        shutil.copytree(ENV_DIR, self.env)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    # -- helpers --------------------------------------------------------------
+    def append(self, team_file, *lines):
+        path = self.env / "policies" / team_file
+        with path.open("a", encoding="utf-8") as f:
+            f.write("\n" + "\n".join(lines) + "\n")
+
+    def teams_text(self):
+        return (self.env / "teams.yaml").read_text(encoding="utf-8")
+
+    def set_teams_text(self, text):
+        (self.env / "teams.yaml").write_text(text, encoding="utf-8")
+
+    def assertFails(self, rule):
+        ok, errors = run_validation(self.env)
+        self.assertFalse(ok, f"expected {rule} to fail, but validation passed")
+        self.assertTrue(any(f"[{rule}]" in e for e in errors),
+                        f"expected a {rule} error, got:\n" + "\n".join(errors))
+
+    def assertPasses(self):
+        ok, errors = run_validation(self.env)
+        self.assertTrue(ok, "expected pass, got:\n" + "\n".join(errors))
+
+    # -- baseline -------------------------------------------------------------
+    def test_real_data_passes(self):
+        self.assertPasses()
+
+    def test_real_prod_data_passes(self):
+        ok, errors = run_validation(ROOT / "overlays" / "prod")
+        self.assertTrue(ok, "\n".join(errors))
+
+    # -- things a team lead SHOULD be able to do ------------------------------
+    def test_new_role_with_team_prefix_is_allowed(self):
+        self.append("policy.eve.csv",
+                    "p, role:eve-alpha-test, applications, get, triton/triton-eve-gateway-mapping, allow",
+                    "g, someone@idfy.com, role:eve-alpha-test")
+        self.assertPasses()
+
+    def test_add_user_to_existing_legacy_role_is_allowed(self):
+        self.append("policy.pg-vs.csv", "g, someone@idfy.com, role:onboardiq-staging-team")
+        self.assertPasses()
+
+    def add_eve_app(self, entry):
+        """Insert an entry at the top of eve's apps list in teams.yaml."""
+        lines = self.teams_text().splitlines()
+        start = lines.index('"eve":')
+        apps_idx = next(i for i in range(start, len(lines)) if lines[i].startswith("  apps:"))
+        lines.insert(apps_idx + 1, f'    - "{entry}"')
+        self.set_teams_text("\n".join(lines) + "\n")
+
+    def test_project_wildcard_entry_covers_apps_inside(self):
+        # Platform grants eve cross-team access to the whole pegasus AppProject
+        self.add_eve_app("pegasus/*")
+        self.append("policy.eve.csv",
+                    "p, role:eve-alpha-test, applications, sync, pegasus/some-pg-app, allow")
+        self.assertPasses()
+
+    def test_project_wildcard_does_not_cover_similar_project(self):
+        self.add_eve_app("pegasus/*")
+        self.append("policy.eve.csv",
+                    "p, role:eve-alpha-test, applications, sync, pegasus-uat/some-app, allow")
+        self.assertFails("R3")
+
+    # -- attacks that MUST fail -----------------------------------------------
+    def test_R2_builtin_admin(self):
+        self.append("policy.eve.csv", "g, someone@idfy.com, role:admin")
+        self.assertFails("R2")
+
+    def test_R2_builtin_readonly(self):
+        self.append("policy.eve.csv", "g, someone@idfy.com, role:readonly")
+        self.assertFails("R2")
+
+    def test_R1_join_platform_role(self):
+        self.append("policy.eve.csv", "g, someone@idfy.com, role:shared-staging-team")
+        self.assertFails("R1")
+
+    def test_R1_extend_platform_role(self):
+        self.append("policy.eve.csv",
+                    "p, role:shared-staging-team, applications, *, triton/triton-eve-gateway-mapping, allow")
+        self.assertFails("R1")
+
+    def test_R1_exact_role_beats_prefix(self):
+        # role:onboardiq-staging-team is pg-vs's role although it matches onboardiq's prefix
+        self.append("policy.onboardiq.csv", "g, someone@idfy.com, role:onboardiq-staging-team")
+        self.assertFails("R1")
+
+    def test_R1_unknown_role_name(self):
+        self.append("policy.eve.csv", "g, someone@idfy.com, role:everest-admin")
+        self.assertFails("R1")
+
+    def test_R3_all_apps(self):
+        self.append("policy.eve.csv", "p, role:eve-alpha-test, applications, *, */*, allow")
+        self.assertFails("R3")
+
+    def test_R3_other_team_app(self):
+        self.append("policy.eve.csv",
+                    "p, role:eve-alpha-test, applications, *, triton/triton-dc-gateway-mapping, allow")
+        self.assertFails("R3")
+
+    def test_R3_new_wildcard_on_shared_project(self):
+        self.append("policy.eve.csv", "p, role:eve-alpha-test, applications, *, triton/*, allow")
+        self.assertFails("R3")
+
+    def test_R4_appproject_edit(self):
+        self.append("policy.eve.csv", "p, role:eve-alpha-test, projects, update, eve-staging, allow")
+        self.assertFails("R4")
+
+    def test_R4_clusters(self):
+        self.append("policy.eve.csv", "p, role:eve-alpha-test, clusters, get, *, allow")
+        self.assertFails("R4")
+
+    def test_G3_role_defined_in_two_files(self):
+        self.append("policy.eve.csv",
+                    "p, role:onboardiq-staging-team, applications, get, triton/triton-eve-gateway-mapping, allow")
+        self.assertFails("G3")
+
+    def test_G4_unregistered_file(self):
+        (self.env / "policies" / "policy.newteam.csv").write_text(
+            "p, role:newteam-x, applications, get, foo/bar, allow\n", encoding="utf-8")
+        self.assertFails("G4")
+
+    def test_G5_file_missing_from_kustomization(self):
+        (self.env / "policies" / "policy.newteam.csv").write_text(
+            "p, role:newteam-x, applications, get, foo/bar, allow\n", encoding="utf-8")
+        self.set_teams_text(self.teams_text() +
+                            '\n"newteam":\n  file: "policy.newteam.csv"\n'
+                            '  role_prefixes: ["role:newteam-"]\n  apps: ["foo/bar"]\n')
+        self.assertFails("G5")
+
+    def test_G1_overlapping_prefixes(self):
+        self.set_teams_text(self.teams_text().replace(
+            '["role:eve-"]', '["role:eve-", "role:dc-"]', 1))
+        self.assertFails("G1")
+
+    def test_schema_old_projects_key_is_rejected(self):
+        text = self.teams_text()
+        self.assertIn("  appProjects:", text)
+        self.set_teams_text(text.replace("  appProjects:", "  projects:", 1))
+        self.assertFails("schema")
+
+    def test_missing_teams_yaml_fails_closed(self):
+        (self.env / "teams.yaml").unlink()
+        ok, errors = run_validation(self.env)
+        self.assertFalse(ok)
+        self.assertTrue(any("teams.yaml" in e and "not found" in e for e in errors))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+

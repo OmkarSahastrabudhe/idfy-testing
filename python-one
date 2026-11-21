@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""ArgoCD RBAC policy validator.
+
+Usage:  python validator.py overlays/<env>/policies/
+
+Two layers of checks:
+
+1. Syntax (every CSV, unchanged from the original validator):
+   p/g line shape, actions, effects, role naming.
+
+2. Scope (team CSVs, driven by ../teams.yaml next to the policies dir):
+   R1  role (p subject / g target) must be owned by the file's team
+       (exact `roles` entry wins over any `role_prefixes` match)
+   R2  built-in role:admin / role:readonly can never be used
+   R3  object must be inside the team's `appProjects`, exactly match an
+       `apps` entry, or be covered by an `apps` entry of the form `project/*`
+   R4  resource must be one of ALLOWED_TEAM_RESOURCES
+   G1  no overlapping role_prefixes between teams
+   G2  an exact role belongs to one team only (and not to a Platform-defined role)
+   G3  a role is defined (p lines) in one CSV only
+   G4  every CSV is registered in teams.yaml (except Platform files) and vice versa
+   G5  every CSV is listed in ../kustomization.yaml configMapGenerator and vice versa
+
+Explicit deny rules are not checked: ArgoCD is deny-by-default and R1/R3
+already confine any rule (allow or deny) to the team's own roles and objects.
+
+The scope layer fails closed: a missing or invalid teams.yaml is an error.
+"""
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Set, Tuple
+
+try:
+    import yaml
+except ImportError:  # reported as a validation error, not a crash
+    yaml = None
+
+
+PLATFORM_FILES = {"policy.platform.csv"}
+BUILTIN_ROLES = {"role:admin", "role:readonly"}
+ALLOWED_TEAM_RESOURCES = {"applications", "applicationsets", "logs", "exec"}
+TEAM_KEYS = {"file", "role_prefixes", "roles", "appProjects", "apps"}
+RBAC_CONFIGMAP = "argocd-rbac-cm"
+
+
+@dataclass
+class ValidationResult:
+    """Result of a policy validation"""
+    file_path: str
+    is_valid: bool
+    errors: List[str]
+    warnings: List[str] = field(default_factory=list)
+
+
+def iter_policy_lines(path: Path) -> Iterator[Tuple[int, str, List[str]]]:
+    """Yield (line_number, stripped_line, fields) for non-empty, non-comment lines."""
+    for num, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        yield num, stripped, [p.strip() for p in stripped.split(",")]
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: syntax
+# ---------------------------------------------------------------------------
+class PolicyValidator:
+
+    # Valid policy types
+    VALID_POLICY_TYPES = {'p', 'g'}
+
+    # Valid effects
+    VALID_EFFECTS = {'allow', 'deny'}
+
+    # Valid actions for ArgoCD
+    VALID_ACTIONS = {
+        'get', 'create', 'update', 'delete', 'sync', 'override',
+        'action', 'action/*', '*'
+    }
+
+    def __init__(self, policies_dir: str = 'policies'):
+        self.policies_dir = Path(policies_dir)
+        self.results: List[ValidationResult] = []
+
+    def policy_files(self) -> List[Path]:
+        return sorted(set(self.policies_dir.glob('policy*.csv')))
+
+    def validate_all_policies(self) -> bool:
+        """Validate all policy files in the policies directory"""
+        if not self.policies_dir.exists():
+            print(f"❌ Error: Policies directory '{self.policies_dir}' not found")
+            return False
+
+        policy_files = self.policy_files()
+
+        if not policy_files:
+            print(f"⚠️  Warning: No policy files found in '{self.policies_dir}'")
+            return True
+
+        print(f"🔍 Found {len(policy_files)} policy file(s) to validate\n")
+
+        all_valid = True
+        for policy_file in policy_files:
+            result = self.validate_policy_file(policy_file)
+            self.results.append(result)
+            all_valid = all_valid and result.is_valid
+
+        return all_valid
+
+    def validate_policy_file(self, file_path: Path) -> ValidationResult:
+        """Validate a single policy file"""
+        errors = []
+        warnings = []
+
+        print(f"Validating: {file_path.name}")
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if not lines or all(not line.strip() or line.strip().startswith('#') for line in lines):
+                errors.append("File is empty or contains only comments")
+                return ValidationResult(str(file_path), False, errors, warnings)
+
+            policy_count = 0
+            group_count = 0
+
+            for line_num, line in enumerate(lines, 1):
+                # Skip empty lines and comments
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+
+                line_errors = self.validate_line(stripped, line_num, line)
+                errors.extend(line_errors)
+
+                if not line_errors:
+                    if stripped.startswith('p,'):
+                        policy_count += 1
+                    elif stripped.startswith('g,'):
+                        group_count += 1
+
+            if policy_count == 0 and group_count == 0:
+                warnings.append("No valid policy or group rules found")
+
+        except FileNotFoundError:
+            errors.append(f"File not found: {file_path}")
+        except Exception as e:
+            errors.append(f"Unexpected error: {str(e)}")
+
+        is_valid = len(errors) == 0
+        return ValidationResult(str(file_path), is_valid, errors, warnings)
+
+    def validate_line(self, line: str, line_num: int, original_line: str = None) -> List[str]:
+        """Validate a single line of policy data"""
+        errors = []
+
+        # Split by comma and strip whitespace
+        parts = [p.strip() for p in line.split(',')]
+
+        if len(parts) < 2:
+            errors.append(f"Line {line_num}: Invalid format - too few fields\n      → {original_line or line}")
+            return errors
+
+        policy_type = parts[0]
+
+        # Validate policy type
+        if policy_type not in self.VALID_POLICY_TYPES:
+            errors.append(
+                f"Line {line_num}: Invalid policy type '{policy_type}'. "
+                f"Must be 'p' (policy) or 'g' (group)\n      → {original_line or line}"
+            )
+            return errors
+
+        # Validate based on type
+        if policy_type == 'p':
+            errors.extend(self.validate_policy_rule(parts, line_num, original_line or line))
+        elif policy_type == 'g':
+            errors.extend(self.validate_group_rule(parts, line_num, original_line or line))
+
+        return errors
+
+    def validate_policy_rule(self, parts: List[str], line_num: int, original_line: str) -> List[str]:
+        """
+        Validate a policy rule (p)
+        Format: p, subject, resource, action, object, effect
+        Example: p, role:admin, applications, *, *, allow
+        """
+        errors = []
+
+        # p rules should have 6 parts: p, sub, res, act, obj, eft
+        if len(parts) < 6:
+            errors.append(
+                f"Line {line_num}: Policy rule has {len(parts)} fields, expected 6 "
+                f"(p, subject, resource, action, object, effect)\n      → {original_line}"
+            )
+            return errors
+
+        _, subject, resource, action, obj, effect = parts[:6]
+
+        # Validate subject (should not be empty)
+        if not subject:
+            errors.append(f"Line {line_num}: Subject cannot be empty\n      → {original_line}")
+        elif not subject.startswith('role:') and '@' not in subject:
+            errors.append(
+                f"Line {line_num}: Subject '{subject}' appears invalid. "
+                f"It should typically start with 'role:' (e.g. 'role:admin') or be an email address.\n      → {original_line}"
+            )
+
+        # Validate resource (typically 'applications', 'repositories', etc.)
+        if not resource:
+            errors.append(f"Line {line_num}: Resource cannot be empty\n      → {original_line}")
+
+        # Validate action
+        if not action:
+            errors.append(f"Line {line_num}: Action cannot be empty\n      → {original_line}")
+        elif action != '*' and action not in self.VALID_ACTIONS:
+            # Check if it's a resource-specific action (e.g., 'action/PodLogs')
+            if not action.startswith('action/'):
+                errors.append(
+                    f"Line {line_num}: Uncommon action '{action}'. "
+                    f"Common actions: {', '.join(sorted(self.VALID_ACTIONS))}\n      → {original_line}"
+                )
+
+        # Validate object (can be *, project/app pattern, etc.)
+        if not obj:
+            errors.append(f"Line {line_num}: Object cannot be empty\n      → {original_line}")
+
+        # Validate effect
+        if effect.lower() not in self.VALID_EFFECTS:
+            errors.append(
+                f"Line {line_num}: Invalid effect '{effect}'. "
+                f"Must be 'allow' or 'deny'\n      → {original_line}"
+            )
+
+        return errors
+
+    def validate_group_rule(self, parts: List[str], line_num: int, original_line: str) -> List[str]:
+        """
+        Validate a group rule (g)
+        Format: g, user/group, role
+        Example: g, admin@example.com, role:admin
+        """
+        errors = []
+
+        # g rules should have 3 parts: g, user/group, role
+        if len(parts) < 3:
+            errors.append(
+                f"Line {line_num}: Group rule has {len(parts)} fields, expected 3 "
+                f"(g, user/group, role)\n      → {original_line}"
+            )
+            return errors
+
+        _, user_or_group, role = parts[:3]
+
+        # Validate user/group (should not be empty)
+        if not user_or_group:
+            errors.append(f"Line {line_num}: User/group cannot be empty\n      → {original_line}")
+
+        # Validate role (should not be empty and typically starts with 'role:')
+        if not role:
+            errors.append(f"Line {line_num}: Role cannot be empty\n      → {original_line}")
+        elif not role.startswith('role:'):
+            errors.append(
+                f"Line {line_num}: Role '{role}' should typically start with 'role:' "
+                f"(e.g., 'role:admin')\n      → {original_line}"
+            )
+        else:
+            # Ensure there's a non-empty role name after the 'role:' prefix
+            role_name = role.split(':', 1)[1].strip()
+            if not role_name:
+                errors.append(
+                    f"Line {line_num}: Role '{role}' is missing a role name after 'role:'\n      → {original_line}"
+                )
+
+        return errors
+
+    def print_summary(self) -> None:
+        """Print validation summary"""
+        print("\n" + "="*60)
+        print("VALIDATION SUMMARY")
+        print("="*60)
+
+        total = len(self.results)
+        valid = sum(1 for r in self.results if r.is_valid)
+        invalid = total - valid
+
+        print(f"\nTotal checks: {total}")
+        print(f"✅ Valid: {valid}")
+        print(f"❌ Invalid: {invalid}")
+
+        # Print detailed errors
+        if invalid > 0:
+            print("\n" + "-"*60)
+            print("ERRORS FOUND:")
+            print("-"*60)
+
+            for result in self.results:
+                if not result.is_valid:
+                    print(f"\n📄 {result.file_path}")
+                    # Use ANSI bold for error text to make it stand out in terminal
+                    bold = '\033[1m'
+                    reset = '\033[0m'
+                    for error in result.errors:
+                        print(f"  ❌ {bold}{error}{reset}")
+
+        # Print warnings
+        warnings_exist = any(r.warnings for r in self.results)
+        if warnings_exist:
+            print("\n" + "-"*60)
+            print("WARNINGS:")
+            print("-"*60)
+
+            for result in self.results:
+                if result.warnings:
+                    print(f"\n📄 {result.file_path}")
+                    for warning in result.warnings:
+                        print(f"  ⚠️  {warning}")
+
+        print("\n" + "="*60)
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: team scope
+# ---------------------------------------------------------------------------
+class ScopeValidator:
+    """Checks that each team CSV only grants what overlays/<env>/teams.yaml allows."""
+
+    def __init__(self, policies_dir: Path):
+        self.policies_dir = Path(policies_dir)
+        self.env_dir = self.policies_dir.parent
+        self.teams_path = self.env_dir / "teams.yaml"
+        self.kustomization_path = self.env_dir / "kustomization.yaml"
+        self.teams: Dict[str, dict] = {}
+        self.file_to_team: Dict[str, str] = {}
+        self.exact_owner: Dict[str, str] = {}   # role -> team (or "platform")
+
+    # -- loading ------------------------------------------------------------
+    def load_teams(self) -> List[str]:
+        if yaml is None:
+            return ["PyYAML is not installed (pip install pyyaml); cannot read teams.yaml"]
+        if not self.teams_path.exists():
+            return [f"{self.teams_path} not found; team scope checks require it"]
+        try:
+            data = yaml.safe_load(self.teams_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as e:
+            return [f"teams.yaml is not valid YAML: {e}"]
+        if not isinstance(data, dict):
+            return ["teams.yaml must be a mapping of team name -> settings"]
+
+        errors = []
+        for name, cfg in data.items():
+            name = str(name)
+            if not isinstance(cfg, dict):
+                errors.append(f"[schema] team '{name}': value must be a mapping")
+                continue
+            unknown = set(cfg) - TEAM_KEYS
+            if unknown:
+                errors.append(f"[schema] team '{name}': unknown key(s) {sorted(unknown)}; "
+                              f"allowed: {sorted(TEAM_KEYS)}")
+            if not isinstance(cfg.get("file"), str) or not cfg["file"]:
+                errors.append(f"[schema] team '{name}': 'file' is required")
+                continue
+            team = {"file": cfg["file"]}
+            for key in ("role_prefixes", "roles", "appProjects", "apps"):
+                value = cfg.get(key) or []
+                if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+                    errors.append(f"[schema] team '{name}': '{key}' must be a list of strings")
+                    value = []
+                team[key] = value
+            for prefix in team["role_prefixes"]:
+                if not (prefix.startswith("role:") and prefix.endswith("-")):
+                    errors.append(f"[schema] team '{name}': role prefix '{prefix}' must look like 'role:<name>-'")
+            for entry in team["apps"]:
+                if "/" not in entry:
+                    errors.append(f"[schema] team '{name}': apps entry '{entry}' must be 'project/app'")
+            if team["file"] in self.file_to_team:
+                errors.append(f"[schema] file '{team['file']}' is assigned to both "
+                              f"'{self.file_to_team[team['file']]}' and '{name}'")
+            self.file_to_team[team["file"]] = name
+            self.teams[name] = team
+        return errors
+
+    # -- ownership ----------------------------------------------------------
+    def role_owner(self, role: str) -> Optional[str]:
+        """Exact owner first; otherwise the single team whose prefix matches."""
+        if role in self.exact_owner:
+            return self.exact_owner[role]
+        matches = [n for n, t in self.teams.items()
+                   if any(role.startswith(p) for p in t["role_prefixes"])]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def team_owns_object(obj: str, team: dict) -> bool:
+        project = obj.split("/", 1)[0]
+        if project in team["appProjects"]:                    # own AppProject
+            return True
+        for entry in team["apps"]:
+            if obj == entry:                                  # exact match
+                return True
+            if entry.endswith("/*") and "*" not in entry[:-2] and obj.startswith(entry[:-1]):
+                return True                                   # 'project/*' covers project/...
+        return False
+
+    # -- global checks --------------------------------------------------------
+    def kustomization_files(self) -> Optional[Set[str]]:
+        """CSV basenames listed in the argocd-rbac-cm configMapGenerator, or None."""
+        if yaml is None or not self.kustomization_path.exists():
+            return None
+        data = yaml.safe_load(self.kustomization_path.read_text(encoding="utf-8")) or {}
+        listed = set()
+        for gen in data.get("configMapGenerator") or []:
+            if gen.get("name") != RBAC_CONFIGMAP:
+                continue
+            for entry in gen.get("files") or []:
+                src = str(entry).split("=", 1)[-1].strip()
+                if src.endswith(".csv"):
+                    listed.add(Path(src).name)
+        return listed
+
+    def global_checks(self, csv_files: List[Path], defined_in: Dict[str, Set[str]]) -> List[str]:
+        errors = []
+        names = {f.name for f in csv_files}
+
+        # G1: overlapping prefixes
+        prefixes = [(p, n) for n, t in self.teams.items() for p in t["role_prefixes"]]
+        for i, (p1, n1) in enumerate(prefixes):
+            for p2, n2 in prefixes[i + 1:]:
+                if n1 != n2 and (p1.startswith(p2) or p2.startswith(p1)):
+                    errors.append(f"[G1] role prefix '{p1}' ({n1}) overlaps '{p2}' ({n2})")
+
+        # G2: an exact role has one owner
+        for name, team in self.teams.items():
+            for role in team["roles"]:
+                other = self.exact_owner.get(role)
+                if other and other != name:
+                    errors.append(f"[G2] role '{role}' is claimed by both '{other}' and '{name}'")
+                else:
+                    self.exact_owner[role] = name
+
+        # G3: a role is defined in one CSV only
+        for role, files in sorted(defined_in.items()):
+            if len(files) > 1:
+                errors.append(f"[G3] role '{role}' is defined in multiple files: {sorted(files)}")
+
+        # G4: registration in teams.yaml
+        for f in sorted(names - PLATFORM_FILES):
+            if f not in self.file_to_team:
+                errors.append(f"[G4] {f} is not registered in teams.yaml")
+        for f, team in sorted(self.file_to_team.items()):
+            if f not in names:
+                errors.append(f"[G4] teams.yaml team '{team}' points to missing file {f}")
+
+        # G5: listed in kustomization configMapGenerator
+        listed = self.kustomization_files()
+        if listed is not None:
+            for f in sorted(names - listed):
+                errors.append(f"[G5] {f} is not listed in kustomization.yaml "
+                              f"configMapGenerator '{RBAC_CONFIGMAP}' (it would never reach ArgoCD)")
+            for f in sorted(listed - names):
+                errors.append(f"[G5] kustomization.yaml lists {f} but the file does not exist")
+        return errors
+
+    # -- per-line checks ------------------------------------------------------
+    def check_role(self, role: str, team_name: str, num: int, line: str) -> List[str]:
+        if role in BUILTIN_ROLES:
+            return [f"Line {num}: [R2] built-in '{role}' cannot be used in team files\n      → {line}"]
+        owner = self.role_owner(role)
+        if owner != team_name:
+            return [f"Line {num}: [R1] role '{role}' is not owned by '{team_name}' "
+                    f"(owner: {owner or 'nobody'})\n      → {line}"]
+        return []
+
+    def check_team_file(self, path: Path, team_name: str) -> List[str]:
+        team = self.teams[team_name]
+        errors = []
+        for num, line, parts in iter_policy_lines(path):
+            if parts[0] == "p" and len(parts) >= 6:
+                subject, resource, _action, obj = parts[1:5]
+                if subject.startswith("role:"):
+                    errors += self.check_role(subject, team_name, num, line)
+                if resource not in ALLOWED_TEAM_RESOURCES:
+                    errors.append(f"Line {num}: [R4] resource '{resource}' is not allowed in team files "
+                                  f"(allowed: {', '.join(sorted(ALLOWED_TEAM_RESOURCES))})\n      → {line}")
+                elif not self.team_owns_object(obj, team):
+                    errors.append(f"Line {num}: [R3] object '{obj}' is outside '{team_name}' scope "
+                                  f"(not in appProjects/apps of teams.yaml)\n      → {line}")
+            elif parts[0] == "g" and len(parts) >= 3:
+                errors += self.check_role(parts[2], team_name, num, line)
+        return errors
+
+    # -- entry point ----------------------------------------------------------
+    def run(self, csv_files: List[Path]) -> List[ValidationResult]:
+        results = []
+        load_errors = self.load_teams()
+        if load_errors:
+            return [ValidationResult(str(self.teams_path), False, load_errors)]
+
+        # Roles defined (p subjects) per file; Platform-defined roles are exact-owned by Platform
+        defined_in: Dict[str, Set[str]] = {}
+        for f in csv_files:
+            for _num, _line, parts in iter_policy_lines(f):
+                if parts[0] == "p" and len(parts) >= 6 and parts[1].startswith("role:"):
+                    defined_in.setdefault(parts[1], set()).add(f.name)
+                    if f.name in PLATFORM_FILES:
+                        self.exact_owner.setdefault(parts[1], "platform")
+
+        global_errors = self.global_checks(csv_files, defined_in)
+        results.append(ValidationResult(f"{self.teams_path} (global checks)", not global_errors, global_errors))
+
+        for f in csv_files:
+            team_name = self.file_to_team.get(f.name)
+            if f.name in PLATFORM_FILES or team_name is None:
+                continue  # Platform file: syntax only; unregistered files already failed G4
+            errs = self.check_team_file(f, team_name)
+            results.append(ValidationResult(f"{f} (scope: {team_name})", not errs, errs))
+        return results
+
+
+def main():
+    """Main entry point"""
+    policies_dir = sys.argv[1] if len(sys.argv) > 1 else 'policies'
+
+    print("Validating policies")
+    print("="*60 + "\n")
+
+    validator = PolicyValidator(policies_dir)
+    syntax_ok = validator.validate_all_policies()
+
+    scope_ok = True
+    if validator.policies_dir.exists():
+        print("\nChecking team scope against teams.yaml")
+        scope_results = ScopeValidator(validator.policies_dir).run(validator.policy_files())
+        validator.results.extend(scope_results)
+        scope_ok = all(r.is_valid for r in scope_results)
+
+    validator.print_summary()
+
+    if syntax_ok and scope_ok:
+        print("\n✅ All policies are valid!")
+        sys.exit(0)
+    else:
+        print("\n❌ Policy validation failed!")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+
